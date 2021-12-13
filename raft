@@ -1,0 +1,259 @@
+#!/usr/bin/python3
+import socket
+import threading
+import pickle
+import time
+import random
+import threading
+import sys
+import json
+from collections import namedtuple, defaultdict
+from types import SimpleNamespace
+
+FOLLOWER = "FOLLOWER"
+LEADER = "LEADER"
+CANDIDATE = "CANDIDATE"
+ELECTION_SCALER = 3001
+MIN_ELECTION_TIMEOUT = 1500
+MUL = 10000
+HEARTBEAT_SCALER = 30
+RPC_SCALER = 10
+REQUESTVOTES_TYPE = "RequestVotes"
+REQUESTVOTES_REPLY_TYPE = "RequestVotesReply"
+APPENDENTRIES_TYPE = "AppendEntriesType"
+APPENDENTRIES_REPLY_TYPE = "AppendEntriesReplyType"
+HEARTBEAT_INTERVAL = 300*0.001
+
+DEBUG = True
+
+node_lock = threading.Lock()
+
+class Message:
+    def __init__(self, term, from_node, message_type, message):
+        self.term = term
+        self.from_node = from_node
+        self.message_type = message_type
+        self.message = message
+
+class AppendEntries:
+    def __init__(self, prevLogIndex, prevLogTerm, entries, leaderCommit):
+        self.prevLogIndex = prevLogIndex
+        self.prevLogTerm = prevLogTerm
+        self.entries = entries
+        self.leaderCommit = leaderCommit
+
+class RequestVote:
+    def __init__(self, lastLogIndex, lastLogTerm):
+        self.lastLogIndex = lastLogIndex
+        self.lastLogTerm = lastLogTerm
+
+def messageJsonDecod(messageDict):
+    return SimpleNamespace(**messageDict)
+
+def dump_append_entries(prevLogIndex, prevLogTerm, entries, leaderCommit):
+    message = AppendEntries(prevLogIndex, prevLogTerm, entries, leaderCommit)
+    return json.dumps(message.__dict__)
+
+def dump_request_vote(lastLogIndex, lastLogTerm):
+    message = RequestVote(lastLogIndex, lastLogTerm)
+    return json.dumps(message.__dict__)
+
+def dump_message(term, node_id, type, message):
+    message = Message(term, node_id, type, message)
+    return json.dumps(message.__dict__)
+
+def report_state(var_name, value):
+    if var_name == "leader":
+        print(f'STATE {var_name}="{str(value)}"', flush=True)
+    else:
+        print(f"STATE {var_name}={value}", flush=True)
+
+def report_commit(log_content, commitIndex):
+    print(f"SEND COMMITTED {log_content} {commitIndex}", flush=True)
+
+def state_log(index, term, curr_log):
+    print(f'STATE log[{index}]=[{term},"{curr_log}"]', flush=True)
+
+class Raft:
+    def __init__(self, node_id, node_num):
+        self.NODE_ID = int(node_id)
+        self.NODE_NUM = int(node_num)
+        self.term = 1
+        self.state = FOLLOWER
+        self.leader = None
+        self.log = [(0, None)]
+        self.commitIndex = 0 # index of highest log entry known to be committed
+        self.lastApplied = 0 # index of highest log entry applied to state machine
+        self.Timeout = self.getNewTimeout(ELECTION_SCALER)
+        self.RPCTimeout = self.getNewTimeout(RPC_SCALER)
+        self.repliedNodes = set()
+
+        # volatile state on leaders
+        self.nextIndex = [len(self.log)]*self.NODE_NUM
+        self.matchIndex = [0]*self.NODE_NUM
+        self.replicated = defaultdict(set)
+
+    def getNewTimeout(self, scaler):
+        return time.time() + max(MIN_ELECTION_TIMEOUT, random.random() * MUL % scaler)*0.001
+
+    def sendAppendEntries(self):
+        while True:
+            if self.state == LEADER:
+                time.sleep(HEARTBEAT_INTERVAL)
+                for targetId in range(self.NODE_NUM):
+                    if targetId == self.NODE_ID:
+                        continue
+                    prevLogIndex = self.nextIndex[targetId]-1
+                    prevLogTerm = self.log[prevLogIndex][0]
+                    entries = self.log[prevLogIndex+1:]
+
+                    append_entries_json = dump_append_entries(prevLogIndex, prevLogTerm, entries, self.commitIndex)
+                    ping_json = dump_message(self.term, self.NODE_ID, APPENDENTRIES_TYPE, append_entries_json)
+
+                    print(f"SEND {targetId} {ping_json}", flush=True)
+
+    def checkTimeout(self):
+        while True:
+            # candidate has revieved majority's votes
+            if self.state == CANDIDATE and len(self.repliedNodes) > self.NODE_NUM // 2:
+                with node_lock:
+                    self.state = LEADER
+                    self.repliedNodes = set()
+                    self.replicated = defaultdict(set)
+                    self.nextIndex = [len(self.log)]*self.NODE_NUM
+                    self.leader = self.NODE_ID
+                    report_state("state", '"LEADER"')
+                    report_state("term", self.term)
+                    report_state("leader", self.NODE_ID)
+
+            if time.time() > self.Timeout and self.state != LEADER:
+                self.startElection()
+
+    def startElection(self):
+        with node_lock:
+            self.Timeout = self.getNewTimeout(ELECTION_SCALER)
+            self.state = CANDIDATE
+            self.term += 1
+            self.leader = None
+            report_state("state", '"CANDIDATE"')
+            report_state("term", self.term)
+            self.repliedNodes = set()
+            self.repliedNodes.add(self.NODE_ID)
+            self.sendRequestVoteRPC()
+
+    def sendRequestVoteRPC(self):
+        # include lastLogIndex and lastLogTerm
+        content = dump_request_vote(len(self.log)-1, self.log[-1][0])
+        message_json = dump_message(self.term, self.NODE_ID, REQUESTVOTES_TYPE, content)
+        for targetId in range(self.NODE_NUM):
+            if targetId == self.NODE_ID or targetId in self.repliedNodes:
+                continue
+            print(f"SEND {targetId} {message_json}", flush=True)
+
+    def receiveRequestVote(self, message):
+        content = json.loads(message.message, object_hook=messageJsonDecod)
+        with node_lock:
+            if message.term > self.term or (self.log[-1][0] < content.lastLogTerm) or (self.log[-1][0] == content.lastLogTerm and len(self.log)-1<content.lastLogIndex):
+                self.Timeout = self.getNewTimeout(ELECTION_SCALER)
+                new_message_json = dump_message(message.term, self.NODE_ID, REQUESTVOTES_REPLY_TYPE, None)
+                print(f"SEND {message.from_node} {new_message_json}", flush=True)
+                self.state = FOLLOWER
+                report_state("state", '"FOLLOWER"')
+                self.term = message.term
+                report_state("term", self.term)
+
+
+    def receiveRequestVoteReply(self, message):
+        self.repliedNodes.add(message.from_node)
+
+    def receiveAppendEntries(self, message):
+        content = json.loads(message.message, object_hook=messageJsonDecod)
+        with node_lock:
+            self.Timeout = self.getNewTimeout(ELECTION_SCALER)
+            # receive heartbeat
+            if self.term <= message.term:
+                if self.state == LEADER:
+                    self.state = FOLLOWER
+                    report_state("state", '"FOLLOWER"')
+                if self.term != message.term:
+                    self.term = message.term
+                    report_state("term", self.term)
+                if self.leader != message.from_node:
+                    self.leader = message.from_node
+                    report_state("leader", self.leader)
+
+                if content.entries: # leader is attempting to replicate logs
+                    if content.prevLogIndex >= len(self.log):
+                        success = False
+                    elif self.log[content.prevLogIndex][0] != content.prevLogTerm: # conflict term
+                        success = False
+                    else:
+                        # delete any entries conflict with new one and append any new entries not already in the log
+                        self.log[content.prevLogIndex+1:] = content.entries
+                        success = len(self.log)
+                        if content.entries:
+                            for i in range(content.prevLogIndex+1, len(self.log)):
+                                curr_entry = self.log[i]
+                                state_log(i, curr_entry[0], curr_entry[1])
+
+                    reply_json = dump_message(self.term, self.NODE_ID, APPENDENTRIES_REPLY_TYPE, success)
+                    print(f"SEND {message.from_node} {reply_json}", flush=True)
+
+                if content.leaderCommit > self.commitIndex:
+                    self.commitIndex = min(content.leaderCommit, len(self.log)-1)
+                    report_state("commitIndex", self.commitIndex)
+
+    def receiveAppendEntriesReply(self, message):
+        with node_lock:
+            if message.message == False:
+                self.nextIndex[message.from_node] -= 1
+            else:
+                self.replicated[message.message-1].add(message.from_node)
+                if len(self.replicated[message.message-1]) > self.NODE_NUM // 2:
+                    # commit
+                    self.commitIndex = message.message-1
+                    report_state("commitIndex", self.commitIndex)
+                self.nextIndex[message.from_node] = message.message
+
+    def receiveMessage(self):
+        while True:
+            line = sys.stdin.readline()
+            command = line.strip().split(" ", 2)
+
+            if command[0] == "LOG":
+                if self.state == LEADER:
+                    curr_log = command[1]
+                    self.log.append((self.term, curr_log))
+                    self.replicated[len(self.log)-1].add(self.NODE_ID)
+                    state_log(len(self.log)-1, self.term, curr_log)
+            else:
+                message = json.loads(command[2], object_hook=messageJsonDecod)
+                if message.message_type == REQUESTVOTES_TYPE:
+                    self.receiveRequestVote(message)
+                elif message.message_type == REQUESTVOTES_REPLY_TYPE:
+                    self.receiveRequestVoteReply(message)
+                elif message.message_type == APPENDENTRIES_TYPE:
+                    self.receiveAppendEntries(message)
+                elif message.message_type == APPENDENTRIES_REPLY_TYPE:
+                    self.receiveAppendEntriesReply(message)
+
+
+def start_service():
+    global NODE_ID, NODE_NUM
+    parameters = check_cl_args()
+    random.seed(int(parameters[0]))
+    raft = Raft(parameters[0], parameters[1])
+    threading.Thread(target=raft.checkTimeout, args=()).start()
+    threading.Thread(target=raft.receiveMessage, args=()).start()
+    threading.Thread(target=raft.sendAppendEntries, args=()).start()
+
+
+def check_cl_args():
+    if len(sys.argv) != 3:
+        print("2 arguments needed: Node_id Nodes_number")
+        sys.exit()
+    return sys.argv[1:]
+
+
+if __name__ == "__main__":
+    start_service()
